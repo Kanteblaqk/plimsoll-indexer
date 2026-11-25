@@ -18,11 +18,17 @@ import (
 )
 
 type testSubscriptionStore struct {
-	webhooks []store.Webhook
+	webhooks   []store.Webhook
+	deliveries []store.WebhookDelivery
 }
 
-func (s testSubscriptionStore) ListWebhooks(context.Context) ([]store.Webhook, error) {
+func (s *testSubscriptionStore) ListWebhooks(context.Context) ([]store.Webhook, error) {
 	return s.webhooks, nil
+}
+
+func (s *testSubscriptionStore) RecordWebhookDelivery(_ context.Context, d store.WebhookDelivery) error {
+	s.deliveries = append(s.deliveries, d)
+	return nil
 }
 
 func testCodec(t *testing.T) *SecretCodec {
@@ -50,7 +56,7 @@ func TestDispatcherSignatureMatchesDocumentedReference(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	dispatcher := NewDispatcher(testSubscriptionStore{webhooks: []store.Webhook{{
+	dispatcher := NewDispatcher(&testSubscriptionStore{webhooks: []store.Webhook{{
 		ID: 1, URL: server.URL, SecretHash: SecretHash(secret), SecretCiphertext: ciphertext,
 	}}}, codec)
 	dispatcher.Client = &http.Client{Timeout: time.Second}
@@ -78,6 +84,78 @@ func TestDispatcherSignatureMatchesDocumentedReference(t *testing.T) {
 	}
 	if payload.Event != "issuer_toml_changed" || payload.OldHash != "old-hash" || payload.NewHash != "new-hash" {
 		t.Fatalf("payload = %+v", payload)
+	}
+}
+
+func TestDispatcherRecordsDeliveryLatency(t *testing.T) {
+	const secret = "receiver-secret"
+	const delay = 25 * time.Millisecond
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		time.Sleep(delay)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	codec := testCodec(t)
+	ciphertext, err := codec.Encrypt(secret)
+	if err != nil {
+		t.Fatal(err)
+	}
+	storage := &testSubscriptionStore{webhooks: []store.Webhook{{
+		ID: 7, URL: server.URL, SecretHash: SecretHash(secret), SecretCiphertext: ciphertext,
+	}}}
+	dispatcher := NewDispatcher(storage, codec)
+	dispatcher.Client = &http.Client{Timeout: time.Second}
+
+	if err := dispatcher.TOMLChanged(context.Background(), "GISSUER", "issuer.example", "old", "new"); err != nil {
+		t.Fatal(err)
+	}
+	if len(storage.deliveries) != 1 {
+		t.Fatalf("recorded %d deliveries, want 1", len(storage.deliveries))
+	}
+	delivery := storage.deliveries[0]
+	if delivery.WebhookID != 7 || delivery.Event != "issuer_toml_changed" ||
+		delivery.StatusCode != http.StatusNoContent || delivery.Error != "" {
+		t.Fatalf("delivery = %+v", delivery)
+	}
+	if delivery.DeliveryLatencyMS < delay.Milliseconds() {
+		t.Errorf("latency = %dms, want at least %dms", delivery.DeliveryLatencyMS, delay.Milliseconds())
+	}
+	if delivery.AttemptedAt.IsZero() {
+		t.Error("attempted_at is zero")
+	}
+}
+
+func TestDispatcherRecordsFailedDeliveryLatency(t *testing.T) {
+	const secret = "receiver-secret"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer server.Close()
+
+	codec := testCodec(t)
+	ciphertext, err := codec.Encrypt(secret)
+	if err != nil {
+		t.Fatal(err)
+	}
+	storage := &testSubscriptionStore{webhooks: []store.Webhook{{
+		ID: 7, URL: server.URL, SecretHash: SecretHash(secret), SecretCiphertext: ciphertext,
+	}}}
+	dispatcher := NewDispatcher(storage, codec)
+	dispatcher.Client = &http.Client{Timeout: time.Second}
+
+	if err := dispatcher.TOMLChanged(context.Background(), "GISSUER", "issuer.example", "old", "new"); err == nil {
+		t.Fatal("expected the failed delivery to be reported")
+	}
+	if len(storage.deliveries) != 1 {
+		t.Fatalf("recorded %d deliveries, want 1", len(storage.deliveries))
+	}
+	delivery := storage.deliveries[0]
+	if delivery.StatusCode != http.StatusServiceUnavailable || delivery.Error == "" {
+		t.Fatalf("delivery = %+v", delivery)
+	}
+	if delivery.DeliveryLatencyMS < 0 {
+		t.Errorf("latency = %dms", delivery.DeliveryLatencyMS)
 	}
 }
 

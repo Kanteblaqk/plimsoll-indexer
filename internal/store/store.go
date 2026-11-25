@@ -33,6 +33,19 @@ type Webhook struct {
 	CreatedAt        time.Time
 }
 
+// WebhookDelivery is one attempted delivery to a webhook destination.
+// DeliveryLatencyMS is measured from sending the request to receiving the
+// complete response, so slow upstreams are visible next to their failures.
+type WebhookDelivery struct {
+	ID                int64
+	WebhookID         int64
+	Event             string
+	StatusCode        int
+	Error             string
+	DeliveryLatencyMS int64
+	AttemptedAt       time.Time
+}
+
 // Open connects to the database and brings its schema up to date by applying
 // any pending migrations (see migrate.go).
 func Open(ctx context.Context, url string) (*Store, error) {
@@ -437,12 +450,73 @@ func (s *Store) ListWebhooks(ctx context.Context) ([]Webhook, error) {
 	return out, rows.Err()
 }
 
+func (s *Store) GetWebhook(ctx context.Context, id int64) (Webhook, bool, error) {
+	var w Webhook
+	err := s.pool.QueryRow(ctx, `
+		SELECT id, url, secret_hash, secret_ciphertext, created_at
+		FROM webhooks WHERE id = $1`, id,
+	).Scan(&w.ID, &w.URL, &w.SecretHash, &w.SecretCiphertext, &w.CreatedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Webhook{}, false, nil
+	}
+	if err != nil {
+		return Webhook{}, false, fmt.Errorf("get webhook: %w", err)
+	}
+	return w, true, nil
+}
+
 func (s *Store) DeleteWebhook(ctx context.Context, id int64) (bool, error) {
 	tag, err := s.pool.Exec(ctx, `DELETE FROM webhooks WHERE id = $1`, id)
 	if err != nil {
 		return false, fmt.Errorf("delete webhook: %w", err)
 	}
 	return tag.RowsAffected() != 0, nil
+}
+
+// RecordWebhookDelivery keeps one delivery attempt, successful or failed, so
+// its latency can be compared with the endpoint's error.
+func (s *Store) RecordWebhookDelivery(ctx context.Context, d WebhookDelivery) error {
+	var errText any
+	if d.Error != "" {
+		errText = d.Error
+	}
+	_, err := s.pool.Exec(ctx, `
+		INSERT INTO webhook_deliveries
+		  (webhook_id, event, status_code, error, delivery_latency_ms, attempted_at)
+		VALUES ($1, $2, $3, $4, $5, $6)`,
+		d.WebhookID, d.Event, d.StatusCode, errText, d.DeliveryLatencyMS, d.AttemptedAt)
+	if err != nil {
+		return fmt.Errorf("record webhook delivery: %w", err)
+	}
+	return nil
+}
+
+// ListWebhookDLQ returns failed delivery attempts for one webhook, newest
+// first. They are the dead letters an operator can inspect and retry.
+func (s *Store) ListWebhookDLQ(ctx context.Context, webhookID int64, limit int) ([]WebhookDelivery, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT id, webhook_id, event, status_code, COALESCE(error, ''),
+		       delivery_latency_ms, attempted_at
+		FROM webhook_deliveries
+		WHERE webhook_id = $1 AND error IS NOT NULL
+		ORDER BY id DESC LIMIT $2`, webhookID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("list webhook DLQ: %w", err)
+	}
+	defer rows.Close()
+	var out []WebhookDelivery
+	for rows.Next() {
+		var d WebhookDelivery
+		if err := rows.Scan(&d.ID, &d.WebhookID, &d.Event, &d.StatusCode, &d.Error,
+			&d.DeliveryLatencyMS, &d.AttemptedAt); err != nil {
+			return nil, fmt.Errorf("scan webhook DLQ entry: %w", err)
+		}
+		out = append(out, d)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list webhook DLQ rows: %w", err)
+	}
+	return out, nil
 }
 
 func mustBig(s string) *big.Int {

@@ -72,3 +72,19 @@ An initial successful fetch establishes a baseline and does not produce a
 change event. A later successful fetch with a different hash is stored as a
 new issuer snapshot, logged as `issuer stellar.toml changed`, and delivered to
 each registered destination.
+
+## Inspect failed deliveries
+
+Every delivery attempt is recorded with the HTTP status, any error, and
+`delivery_latency_ms`: the time from sending the request to receiving the
+complete response. Failed attempts are the webhook's dead-letter queue, and
+can be listed with the administrator token:
+
+```bash
+curl https://indexer.example/v1/webhooks/1/dlq \
+  -H "Authorization: Bearer $WEBHOOK_ADMIN_TOKEN"
+```
+
+The response is `{"deliveries": [...]}`, newest first. Use `limit` (1-1000,
+default 100) to bound it. A high `delivery_latency_ms` alongside a failure
+points at a slow upstream endpoint rather than a rejected signature.

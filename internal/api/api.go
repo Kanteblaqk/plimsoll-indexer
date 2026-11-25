@@ -71,6 +71,13 @@ type WebhookManager interface {
 	DeleteWebhook(context.Context, int64) (bool, error)
 }
 
+// WebhookDLQReader exposes failed delivery attempts. It is separate from
+// WebhookManager so management-only stores need not implement it.
+type WebhookDLQReader interface {
+	GetWebhook(context.Context, int64) (store.Webhook, bool, error)
+	ListWebhookDLQ(context.Context, int64, int) ([]store.WebhookDelivery, error)
+}
+
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", s.health)
@@ -86,6 +93,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/breakdowns/{hash}", s.breakdown)
 	mux.HandleFunc("POST /v1/webhooks", s.createWebhook)
 	mux.HandleFunc("GET /v1/webhooks", s.listWebhooks)
+	mux.HandleFunc("GET /v1/webhooks/{id}/dlq", s.listWebhookDLQ)
 	mux.HandleFunc("DELETE /v1/webhooks/{id}", s.deleteWebhook)
 	return s.cors(errorEnvelope(mux))
 }
@@ -141,6 +149,16 @@ type webhookJSON struct {
 type createdWebhookJSON struct {
 	webhookJSON
 	Secret string `json:"secret"`
+}
+
+type webhookDeliveryJSON struct {
+	ID                int64     `json:"id"`
+	WebhookID         int64     `json:"webhook_id"`
+	Event             string    `json:"event"`
+	StatusCode        int       `json:"status_code"`
+	Error             string    `json:"error"`
+	DeliveryLatencyMS int64     `json:"delivery_latency_ms"`
+	AttemptedAt       time.Time `json:"attempted_at"`
 }
 
 func toSupply(sp *coverage.Supply) *supplyJSON {
@@ -464,6 +482,54 @@ func (s *Server) listWebhooks(w http.ResponseWriter, r *http.Request) {
 		out = append(out, webhookJSON{ID: item.ID, URL: item.URL, CreatedAt: item.CreatedAt})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"webhooks": out})
+}
+
+func (s *Server) listWebhookDLQ(w http.ResponseWriter, r *http.Request) {
+	if !s.webhookConfigured(w) || !s.authorizeWebhookAdmin(w, r) {
+		return
+	}
+	reader, ok := s.WebhookStore.(WebhookDLQReader)
+	if !ok {
+		writeError(w, http.StatusServiceUnavailable, codeWebhooksNotConfigured, "webhook delivery history is not configured")
+		return
+	}
+	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil || id < 1 {
+		writeErrorDetails(w, http.StatusBadRequest, codeInvalidWebhookID,
+			"webhook id must be a positive integer", map[string]any{"id": r.PathValue("id")})
+		return
+	}
+	limit, ok := parseLimit(w, r)
+	if !ok {
+		return
+	}
+	_, found, err := reader.GetWebhook(r.Context(), id)
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	if !found {
+		writeError(w, http.StatusNotFound, codeWebhookNotFound, "webhook not found")
+		return
+	}
+	items, err := reader.ListWebhookDLQ(r.Context(), id, limit)
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	out := make([]webhookDeliveryJSON, 0, len(items))
+	for _, item := range items {
+		out = append(out, webhookDeliveryJSON{
+			ID:                item.ID,
+			WebhookID:         item.WebhookID,
+			Event:             item.Event,
+			StatusCode:        item.StatusCode,
+			Error:             item.Error,
+			DeliveryLatencyMS: item.DeliveryLatencyMS,
+			AttemptedAt:       item.AttemptedAt.UTC(),
+		})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"deliveries": out})
 }
 
 func (s *Server) deleteWebhook(w http.ResponseWriter, r *http.Request) {

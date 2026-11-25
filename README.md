@@ -69,6 +69,7 @@ The command fetches the asset's snapshot breakdown from the indexer, verifies th
 | `GET /v1/changelog` | Breaking API changes per released version, newest first |
 | `GET /v1/breakdowns/{hash}` | Exact bytes of a supply breakdown |
 | `POST /v1/webhooks`, `GET /v1/webhooks`, `DELETE /v1/webhooks/{id}` | Manage authenticated issuer TOML change subscriptions |
+| `GET /v1/webhooks/{id}/dlq?limit=100` | Failed webhook deliveries with the latency of each attempt |
 
 Every `4xx` and `5xx` response has the same body:
 `{"code":"asset_not_listed","message":"…"}`, with an optional `details` object.
